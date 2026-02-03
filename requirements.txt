@@ -41,3 +41,4 @@ tqdm>=4.62.0
 pytest>=6.2.0
 pytest-cov>=3.0.0
 nbstripout>=0.6.0
+nbdime>=4.0.0

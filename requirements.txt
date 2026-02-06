@@ -28,6 +28,7 @@ plotly>=5.3.0
 jupyter>=1.0.0
 ipykernel>=6.0.0
 notebook>=6.4.0
+jupytext>=1.14.0
 
 # Data Quality and Validation
 ydata-profiling>=4.0.0

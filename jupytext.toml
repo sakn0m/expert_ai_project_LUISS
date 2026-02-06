@@ -1,0 +1,11 @@
+# Jupytext configuration file
+# This file ensures that notebooks are always paired with a python script
+# and that the python script is the source of truth for git.
+
+# Default format for pairing
+formats = "ipynb,py:percent"
+
+# Categories of cells to include in the python file
+# We don't want to include large outputs in the .py file
+notebook_metadata_filter = "jupytext,-kernelspec"
+cell_metadata_filter = "-all"

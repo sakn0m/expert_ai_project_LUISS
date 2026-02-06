@@ -20,13 +20,13 @@ def main():
         print("⚠️ Pip install failed. If you use conda, make sure your environment is active.")
         # We continue anyway to try and pair the notebook if jupytext is already there
     
-    # Files
-    py_file = "notebook.py"
+    # Files (relative to root)
+    py_file = os.path.join("scripts", "notebook.py")
     ipynb_file = "notebook.ipynb"
 
     # 2. Check if notebook.py exists (the source of truth)
     if not os.path.exists(py_file):
-        print(f"❌ Error: {py_file} not found! Are you in the right folder?")
+        print(f"❌ Error: {py_file} not found! Run this script from the project root.")
         return
 
     # 3. Create the notebook file if it is missing (since it's gitignored)
@@ -36,12 +36,13 @@ def main():
 
     # 4. Activate the pairing
     print("🔗 Linking the Notebook and the Python script...")
-    run_command(f"jupytext --set-formats ipynb,py:percent {ipynb_file}")
+    # This format tells Jupytext to link the root ipynb with the py in scripts/
+    run_command(f"jupytext --set-formats ipynb,scripts//py:percent {ipynb_file}")
 
     print("\n✅ ALL SET!")
     print(f"1. You can now open '{ipynb_file}' in Jupyter.")
-    print("2. Every time you SAVE the notebook, the '.py' file will update automatically.")
-    print("3. ONLY commit and push the '.py' file to Git.")
+    print(f"2. Every time you SAVE the notebook, the '{py_file}' file will update automatically.")
+    print("3. ONLY commit and push the 'scripts/' folder to Git.")
     print("\n💡 Tip for VS Code users: Install the 'Jupytext Sync' extension.")
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 # Jupytext configuration file
 # This file ensures that notebooks are always paired with a python script
-# and that the python script is the source of truth for git.
+# and that the python script is stored in the 'scripts' folder.
 
-# Default format for pairing
-formats = "ipynb,py:percent"
+# Default format for pairing: ipynb in root, py in 'scripts' folder
+formats = "ipynb,scripts//py:percent"
 
 # Categories of cells to include in the python file
 # We don't want to include large outputs in the .py file

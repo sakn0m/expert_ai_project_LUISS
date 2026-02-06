@@ -82,7 +82,7 @@ print("Libraries imported successfully!")
 
 # %%
 # Load training data
-train_df = pd.read_csv('../data/processed/train_data.csv')
+train_df = pd.read_csv('dataset/train_data.csv')
 
 print(f"Dataset shape: {train_df.shape}")
 print(f"\nColumns: {train_df.columns.tolist()}")

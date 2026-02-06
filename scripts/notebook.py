@@ -2,7 +2,7 @@
 # jupyter:
 #   jupytext:
 #     cell_metadata_filter: -all
-#     formats: ipynb,py:percent
+#     formats: ipynb,scripts//py:percent
 #     notebook_metadata_filter: jupytext,-kernelspec
 #     text_representation:
 #       extension: .py

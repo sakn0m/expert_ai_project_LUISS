@@ -24,6 +24,12 @@ def main():
     py_file = os.path.join("scripts", "notebook.py")
     ipynb_file = "notebook.ipynb"
 
+    # Verify we are in the root
+    if os.path.basename(os.getcwd()) == "scripts":
+        print("❌ Error: Please run this script from the PROJECT ROOT folder (one level up).")
+        print("   Ex: python scripts/setup_project.py")
+        return
+
     # 2. Check if notebook.py exists (the source of truth)
     if not os.path.exists(py_file):
         print(f"❌ Error: {py_file} not found! Run this script from the project root.")
@@ -32,7 +38,8 @@ def main():
     # 3. Create the notebook file if it is missing (since it's gitignored)
     if not os.path.exists(ipynb_file):
         print(f"📓 Creating {ipynb_file} from {py_file}...")
-        run_command(f"jupytext --to ipynb {py_file}")
+        # explicitly output to the root directory
+        run_command(f"jupytext --to ipynb --output {ipynb_file} {py_file}")
 
     # 4. Activate the pairing
     print("🔗 Linking the Notebook and the Python script...")

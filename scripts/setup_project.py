@@ -14,25 +14,28 @@ def run_command(command):
 def main():
     print("🚀 --- Expert AI Project Setup ---")
     
+    # DETERMINE PROJECT ROOT
+    # This script is located in <ROOT>/scripts/setup_project.py
+    script_path = os.path.abspath(__file__)     # .../scripts/setup_project.py
+    script_dir = os.path.dirname(script_path)   # .../scripts
+    project_root = os.path.dirname(script_dir)  # .../
+    
+    # Change working directory to Project Root so all paths work
+    os.chdir(project_root)
+    print(f"📂 Working in project root: {project_root}")
+
     # 1. Install Jupytext and other dependencies
     print("\n📦 Installing/Updating dependencies...")
     if not run_command("pip install -r requirements.txt"):
         print("⚠️ Pip install failed. If you use conda, make sure your environment is active.")
-        # We continue anyway to try and pair the notebook if jupytext is already there
     
     # Files (relative to root)
     py_file = os.path.join("scripts", "notebook.py")
     ipynb_file = "notebook.ipynb"
 
-    # Verify we are in the root
-    if os.path.basename(os.getcwd()) == "scripts":
-        print("❌ Error: Please run this script from the PROJECT ROOT folder (one level up).")
-        print("   Ex: python scripts/setup_project.py")
-        return
-
     # 2. Check if notebook.py exists (the source of truth)
     if not os.path.exists(py_file):
-        print(f"❌ Error: {py_file} not found! Run this script from the project root.")
+        print(f"❌ Error: {py_file} not found! Something is wrong with the repo structure.")
         return
 
     # 3. Create the notebook file if it is missing (since it's gitignored)

@@ -90,11 +90,11 @@ print("Libraries imported successfully!")
 # description of the challenge and that the files were loaded correctly.
 
 # %%
-path_train = "train_data.csv"
-path_test = "test_features.csv"
+path_train = "./dataset/train_data.csv"
+path_test = "./dataset/test_features.csv"
 
-train = pd.read_csv(dataset/train_data.csv)
-test  = pd.read_csv(dataset/test_features.csv)
+train = pd.read_csv(path_train)
+test  = pd.read_csv(path_test)
 
 print("Train_data shape:", train.shape)
 print("Test_features shape :", test.shape)

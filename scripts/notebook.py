@@ -5696,9 +5696,6 @@ plt.show()
 # %% [markdown]
 # ### **16.1  End-to-End Summary**
 #
-# This project built a complete ML pipeline for **bankruptcy prediction** on Italian
-# company financial data (LUISS Italian Financial Challenge — Challenge 1).
-#
 # | Phase | Key decisions |
 # |---|---|
 # | **EDA** | Identified 0.71 % class imbalance, temporal drift (COVID shock 2020), sector concentration |
@@ -5811,6 +5808,6 @@ print("=" * 58)
 
 # %%
 print("\n" + "=" * 60)
-print("  NOTEBOOK COMPLETE — Italian Financial Challenge")
-print("  Group 18 | Challenge 1: Bankruptcy Prediction")
+print("  NOTEBOOK COMPLETE")
+print("  Thank you for the attention!")
 print("=" * 60)

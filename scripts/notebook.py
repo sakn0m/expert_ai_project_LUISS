@@ -5122,6 +5122,92 @@ else:
 print(f"\nChampion model selected: {best_model_name}")
 print(f"Classification threshold: {best_threshold:.4f}")
 
+# %% [markdown]
+# ### **12.7  Stacking Ensemble**
+#
+# A stacking (meta-learning) ensemble combines the probability outputs of the
+# three best base classifiers as inputs to a Logistic Regression meta-learner.
+#
+# **Why out-of-fold (OOF) predictions?**
+# If the meta-learner trained on predictions from the same data used by the base
+# models, it would see inflated (overfit) probabilities.  OOF cross-validation
+# generates predictions for each training sample using a model that *never saw
+# that sample* — providing honest, unbiased training data for the meta-learner.
+#
+# | Level | Models | Purpose |
+# |---|---|---|
+# | 0 (base) | XGBoost (tuned) + LightGBM (tuned) + Random Forest | Diverse probability estimates |
+# | 1 (meta) | Logistic Regression (`class_weight='balanced'`) | Blend base predictions |
+
+# %%
+from sklearn.model_selection import cross_val_predict as _cvp
+
+
+class StackingEnsemble:
+    """
+    Two-level stacking ensemble with a sklearn-compatible predict_proba interface.
+    Base models must implement predict_proba; meta_model is a binary classifier.
+    """
+    def __init__(self, base_models, meta_model):
+        self.base_models = base_models
+        self.meta_model  = meta_model
+
+    def _meta_features(self, X):
+        return np.column_stack([m.predict_proba(X)[:, 1] for m in self.base_models])
+
+    def predict_proba(self, X):
+        return self.meta_model.predict_proba(self._meta_features(X))
+
+    def predict(self, X):
+        return self.meta_model.predict(self._meta_features(X))
+
+
+# ---- Level-0: out-of-fold predictions on training data (prevents leakage) ----
+print("Computing OOF predictions for Level-0 base models (≈3 min)…")
+_cv_stack = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+
+oof_xgb  = _cvp(xgb_best,  X_train_scaled, y_train, cv=_cv_stack, method='predict_proba')[:, 1]
+oof_lgbm = _cvp(lgbm_best, X_train_scaled, y_train, cv=_cv_stack, method='predict_proba')[:, 1]
+oof_rf   = _cvp(rf,        X_train_scaled, y_train, cv=_cv_stack, method='predict_proba')[:, 1]
+print("OOF predictions done.")
+
+# ---- Level-1: meta-learner ----
+X_meta_train = np.column_stack([oof_xgb, oof_lgbm, oof_rf])
+_meta_lr = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=RANDOM_STATE)
+_meta_lr.fit(X_meta_train, y_train)
+print("Meta-learner trained.")
+
+# ---- Wrap into the ensemble ----
+stacking_model     = StackingEnsemble([xgb_best, lgbm_best, rf], _meta_lr)
+stacking_threshold, stacking_f1 = find_best_threshold(stacking_model, X_val_scaled, y_val)
+stacking_res = evaluate_on_val(stacking_model, X_val_scaled, y_val,
+                               "Stacking Ensemble", stacking_threshold)
+
+print(f"\n=== Stacking Ensemble — Validation Set ===")
+for k, v in stacking_res.items():
+    if k != "Model":
+        print(f"  {k:<14}: {v}")
+
+# ---- Compare and update champion ----
+_current_f1 = evaluate_on_val(best_model, X_val_scaled, y_val,
+                               best_model_name, best_threshold)['F1']
+
+# Save the best individual tree model — used for SHAP and feature importance
+# (StackingEnsemble has no feature_importances_ over the original 55 features)
+tree_model_for_shap = best_model
+
+if stacking_f1 > _current_f1:
+    print(f"\n✓ Stacking ({stacking_f1:.4f}) beats {best_model_name} ({_current_f1:.4f})")
+    best_model      = stacking_model
+    best_threshold  = stacking_threshold
+    best_model_name = "Stacking Ensemble"
+else:
+    print(f"\n{best_model_name} ({_current_f1:.4f}) remains champion "
+          f"(stacking: {stacking_f1:.4f}).")
+
+print(f"\nFinal champion : {best_model_name}  (threshold = {best_threshold:.4f})")
+print(f"[SHAP / feature importance will use: {tree_model_for_shap.__class__.__name__}]")
+
 
 # %% [markdown]
 # ---
@@ -5145,6 +5231,8 @@ tuned_models = {
     "XGBoost  (tuned, opt-thr)":    (xgb_best,   threshold_xgb),
     "LightGBM (tuned, opt-thr)":    (lgbm_best,  threshold_lgbm),
 }
+# Add stacking ensemble to comparison
+tuned_models["Stacking Ensemble"] = (stacking_model, stacking_threshold)
 
 all_results = [
     evaluate_on_val(m, X_val_scaled, y_val, name, thr)
@@ -5299,6 +5387,62 @@ print("=" * 60)
 # and profitability signals that a linear model cannot capture.
 # The SMOTE + RF pipeline can under-perform if synthetic interpolation produces
 # unrealistic financial profiles in such a sparse positive class.
+#
+#
+
+# %% [markdown]
+# ### **13.6b  Calibration Curve (Reliability Diagram)**
+#
+# A calibration curve checks whether a model's predicted probabilities are
+# **truthful**: if the model says "30 % chance of bankruptcy", roughly 30 % of
+# those firms should actually go bankrupt.
+#
+# This is **mandatory for credit-risk applications** under Basel III / CRR2:
+# banks must use *calibrated* Probability of Default (PD) estimates to compute
+# regulatory capital requirements (IRB approach).  An uncalibrated model would
+# either over-reserve (too conservative) or under-reserve (regulatory breach).
+#
+# - A curve **above** the diagonal → model under-predicts risk (dangerous for banks)
+# - A curve **below** the diagonal → model over-predicts risk (costly in capital)
+
+# %%
+from sklearn.calibration import calibration_curve
+
+fig, ax = plt.subplots(figsize=(7, 6))
+_cal_models = {
+    "XGBoost (tuned)":      xgb_best,
+    "LightGBM (tuned)":     lgbm_best,
+    "Random Forest":         rf,
+    "Logistic Regression":   lr,
+}
+_cal_colors = ['#E84855', '#2ECC71', '#4C9BE8', '#F39C12']
+
+for (name, m), col in zip(_cal_models.items(), _cal_colors):
+    prob = m.predict_proba(X_val_scaled)[:, 1]
+    frac_pos, mean_pred = calibration_curve(y_val, prob, n_bins=8, strategy='quantile')
+    ax.plot(mean_pred, frac_pos, marker='o', label=name, color=col, linewidth=2)
+
+ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect calibration')
+ax.set_xlabel("Mean predicted probability")
+ax.set_ylabel("Fraction of true positives")
+ax.set_title("Calibration Curve (Reliability Diagram) — Validation 2021")
+ax.legend(fontsize=9)
+ax.set_xlim([0, None])
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# **Interpretation**
+#
+# Tree-based models (XGBoost, LightGBM, RF) are known to produce **poorly
+# calibrated probabilities** — they tend to push predictions towards 0 and 1
+# (overconfidence).  Logistic Regression is generally better calibrated because
+# the logistic function explicitly maps the linear score to a probability.
+#
+# For deployment in a credit-risk system, the champion model's probabilities
+# should be post-processed with **isotonic regression** or **Platt scaling**
+# (`sklearn.calibration.CalibratedClassifierCV`) before being used as PD
+# estimates for regulatory capital calculations.
 
 
 # %% [markdown]
@@ -5318,7 +5462,9 @@ print("=" * 60)
 # %%
 # Extract feature importances from the champion model (handles both XGB and LGBM)
 feature_names = list(X_train_scaled.columns)
-importances = best_model.feature_importances_
+# Use the best individual tree model for feature importance
+# (StackingEnsemble routes through tree_model_for_shap defined in Section 12.7)
+importances = tree_model_for_shap.feature_importances_
 
 imp_df = pd.DataFrame({
     'Feature': feature_names,
@@ -5349,7 +5495,7 @@ print(imp_df.head(10).to_string(index=False))
 SHAP_SAMPLE = min(800, len(X_val_scaled))
 X_shap = X_val_scaled.sample(SHAP_SAMPLE, random_state=RANDOM_STATE)
 
-explainer   = shap.TreeExplainer(best_model)
+explainer   = shap.TreeExplainer(tree_model_for_shap)  # always a tree model
 shap_values = explainer.shap_values(X_shap)
 
 # For binary classifiers: shap_values may be a list [class0, class1] (RF) or a 2D array (XGB/LGBM)
@@ -5632,6 +5778,113 @@ print("which can lower detection rates in lower quartiles.")
 #   Sequential deterioration patterns (e.g., 3 years of declining margins)
 #   are partially captured through the engineered trend features but not
 #   through a full longitudinal model.
+#
+#
+
+# %% [markdown]
+# ### **14.5  Cost-Benefit Analysis**
+#
+# F1-Score is a useful statistical metric, but decision-makers care about **money**.
+# This section quantifies the economic value of the model under realistic Italian
+# mid-market lending assumptions.
+#
+# **Assumptions (conservative, industry-standard):**
+#
+# | Parameter | Value | Rationale |
+# |---|---|---|
+# | Average loan at risk per firm | €800 000 | Italian mid-market SME credit facility |
+# | Loss Given Default (LGD) | 50 % | EU average LGD on corporate unsecured exposures |
+# | Expected loss per missed bankruptcy | €400 000 | AVG_LOAN × LGD |
+# | Analyst review cost per false alarm | €1 500 | ~1 day of senior credit analyst time |
+#
+# **Baseline:** a bank that flags *nobody* loses €400k for every bankrupt firm
+# it fails to detect.  The model's value is how much of that loss it avoids,
+# net of false-alarm review costs.
+
+# %%
+from sklearn.metrics import confusion_matrix as _cm
+
+AVG_LOAN_EUR       = 800_000
+LGD_RATE           = 0.50
+LOSS_PER_FN        = AVG_LOAN_EUR * LGD_RATE   # €400 000 per missed bankruptcy
+REVIEW_COST_PER_FP = 1_500                      # €1 500 per false alarm
+
+def model_economics(y_true, y_pred, loss_fn=LOSS_PER_FN, cost_fp=REVIEW_COST_PER_FP):
+    """Return confusion-matrix counts and economic costs."""
+    tn, fp, fn, tp = _cm(y_true, y_pred).ravel()
+    total_cost = fn * loss_fn + fp * cost_fp
+    return {'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Total cost (€)': total_cost}
+
+# Build comparison across models
+y_true_arr = y_val.values
+
+# No-model baseline: never flag anyone
+_y_nomodel = np.zeros(len(y_true_arr), dtype=int)
+_base_cost  = model_economics(y_true_arr, _y_nomodel)['Total cost (€)']
+
+_econ_rows = []
+_scenarios = {
+    "No model (all healthy)":         _y_nomodel,
+    "Altman Z-Score (rule)":          altman_pred.values if hasattr(altman_pred, 'values') else altman_pred,
+    best_model_name:                  (best_model.predict_proba(X_val_scaled)[:, 1] >= best_threshold).astype(int),
+}
+
+for name, y_pred_c in _scenarios.items():
+    eco = model_economics(y_true_arr, y_pred_c)
+    savings_vs_nomodel = _base_cost - eco['Total cost (€)']
+    _econ_rows.append({
+        "Model":                   name,
+        "TP (caught bankruptcies)": eco['TP'],
+        "FP (false alarms)":        eco['FP'],
+        "FN (missed)":              eco['FN'],
+        "Total cost (€k)":          round(eco['Total cost (€)'] / 1_000, 0),
+        "Savings vs no-model (€k)": round(savings_vs_nomodel / 1_000, 0),
+        "ROI (savings / FP cost)":  round(savings_vs_nomodel / max(eco['FP'] * REVIEW_COST_PER_FP, 1), 1),
+    })
+
+econ_df = pd.DataFrame(_econ_rows)
+print(f"=== Cost-Benefit Analysis (Validation 2021) ===")
+print(f"Assumptions: LGD = €{LOSS_PER_FN:,.0f} per missed bankruptcy | "
+      f"€{REVIEW_COST_PER_FP:,.0f} per false alarm")
+print()
+print(econ_df.to_string(index=False))
+
+# ── Visual: total cost + savings ──
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].bar(econ_df["Model"], econ_df["Total cost (€k)"],
+            color=['#C0392B', '#F39C12', '#2ECC71'], edgecolor='white')
+axes[0].set_ylabel("Total cost (€ thousands)")
+axes[0].set_title("Model Cost Comparison")
+axes[0].tick_params(axis='x', rotation=15)
+
+axes[1].bar(econ_df["Model"], econ_df["Savings vs no-model (€k)"],
+            color=['#C0392B', '#F39C12', '#2ECC71'], edgecolor='white')
+axes[1].axhline(0, color='black', linewidth=0.8)
+axes[1].set_ylabel("Savings vs no-model (€ thousands)")
+axes[1].set_title("Economic Value Generated vs Baseline")
+axes[1].tick_params(axis='x', rotation=15)
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# **Business interpretation**
+#
+# The cost-benefit table translates abstract ML metrics into language that a
+# Chief Risk Officer understands:
+#
+# - **No model**: every bankruptcy in the validation set is missed → the bank
+#   absorbs the full loss for each defaulted exposure.
+# - **Altman Z-Score rule**: a well-known heuristic that catches some bankruptcies
+#   but with a fixed, non-optimised threshold.
+# - **Champion ML model**: by tuning both the model parameters *and* the
+#   classification threshold on the precision-recall curve, we maximise the
+#   number of bankruptcies caught (recall) while keeping false alarms manageable.
+#
+# The "ROI" column shows how many euros of avoided loss are generated for every
+# euro spent on unnecessary analyst reviews (false alarms).  A ROI > 10 makes
+# the model economically compelling even before accounting for reputational risk.
 
 
 # %% [markdown]

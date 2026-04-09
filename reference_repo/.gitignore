@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_backup
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Model artifacts and outputs
+*.pkl
+*.joblib
+*.h5
+*.pth
+
+# Data files (keep only the provided datasets)
+data/raw/
+data/interim/
+data/external/
+
+# Plots and visualizations (students generate their own)
+*.png
+*.jpg
+*.jpeg
+*.pdf
+plots/
+figures/
+
+# Logs
+*.log
+
+# Teacher materials (CONFIDENTIAL - should never be in student repo)
+teacher/
+*_solution.py
+*_solution.ipynb
+test_targets.csv
+full_dataset.csv
+EVALUATION_RUBRIC.md

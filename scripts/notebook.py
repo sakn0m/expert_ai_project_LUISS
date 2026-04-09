@@ -90,8 +90,8 @@ print("Libraries imported successfully!")
 # description of the challenge and that the files were loaded correctly.
 
 # %%
-path_train = "./dataset/train_data.csv"
-path_test = "./dataset/test_features.csv"
+path_train = "./data/raw/train_data.csv"
+path_test = "./data/raw/test_features.csv"
 
 train = pd.read_csv(path_train)
 test  = pd.read_csv(path_test)
@@ -4422,11 +4422,11 @@ plt.show()
 # The saved files therefore represent the **final input of the Feature Engineering stage** and the starting point for the remaining modeling pipeline.
 
 # %%
-df_train_fe.to_csv("train_data_enhanced.csv", index=False)
-df_test_fe.to_csv("test_features_enhanced.csv", index=False)
+df_train_fe.to_csv("data/processed/train_data_enhanced.csv", index=False)
+df_test_fe.to_csv("data/processed/test_features_enhanced.csv", index=False)
 
-print("Saved to: train_data_enhanced.csv")
-print("Saved to: test_features_enhanced.csv")
+print("Saved to: data/processed/train_data_enhanced.csv")
+print("Saved to: data/processed/test_features_enhanced.csv")
 
 print("\nFeature Engineering Pipeline Completed Successfully.")
 print(f"Final Train Columns: {df_train_fe.shape[1]}")
@@ -4933,7 +4933,7 @@ print("SMOTE + RF     — trained  ✓")
 
 # %%
 # Load pre-computed Altman Z-like score from the enhanced CSV (unscaled original values)
-train_meta = pd.read_csv('./train_data_enhanced.csv')
+train_meta = pd.read_csv('./data/processed/train_data_enhanced.csv')
 val_meta = train_meta[train_meta['fiscal_year'] == 2021].reset_index(drop=True)
 
 # Safety check: same number of observations as y_val
@@ -5896,7 +5896,7 @@ plt.show()
 
 # %%
 # Load company_id and fiscal_year from the enhanced test CSV (they were dropped during preprocessing)
-test_meta = pd.read_csv('./test_features_enhanced.csv', usecols=['company_id', 'fiscal_year'])
+test_meta = pd.read_csv('./data/processed/test_features_enhanced.csv', usecols=['company_id', 'fiscal_year'])
 assert len(test_meta) == len(X_test_scaled), \
     f"Shape mismatch: test_meta={len(test_meta)}, X_test_scaled={len(X_test_scaled)}"
 
@@ -5912,14 +5912,14 @@ submission = pd.DataFrame({
     'bankruptcy_probability': np.round(y_prob_test, 6),
 })
 
-submission.to_csv('./submission.csv', index=False)
+submission.to_csv('./data/processed/submission.csv', index=False)
 
 print("=== Test Predictions Summary ===")
 print(f"Total test observations : {len(submission)}")
 print(f"Predicted bankruptcies  : {y_pred_test.sum()}  "
       f"({y_pred_test.mean()*100:.2f} % of test set)")
 print(f"Probability range       : [{y_prob_test.min():.4f}, {y_prob_test.max():.4f}]")
-print(f"\nSubmission file saved → ./submission.csv")
+print(f"\nSubmission file saved → ./data/processed/submission.csv")
 print(submission.head(10).to_string(index=False))
 
 

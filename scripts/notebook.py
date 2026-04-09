@@ -3334,38 +3334,6 @@ df_train_fe[
 #
 
 # %%
-# Select only numeric feature columns (exclude target / IDs / leakage-prone variables)
-exclude_corr = ["company_id", "bankruptcy_next_year", "financial_health_class", "revenue_change"]
-numeric_df = df_train_fe.select_dtypes(include=[np.number]).drop(
-    columns=[c for c in exclude_corr if c in df_train_fe.columns],
-    errors="ignore"
-)
-
-# Correlation matrix
-corr_matrix = numeric_df.corr()
-
-# Identify highly correlated pairs
-upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-to_drop = [column for column in upper.columns if any(upper[column].abs() > 0.9)]
-
-print("High-correlation features (>0.9) to consider dropping:")
-print(to_drop)
-
-# Optional: show exact high-correlation pairs
-high_corr_pairs = []
-for col in upper.columns:
-    for row in upper.index:
-        val = upper.loc[row, col]
-        if pd.notna(val) and abs(val) > 0.9:
-            high_corr_pairs.append((row, col, val))
-
-if len(high_corr_pairs) > 0:
-    print("\nHighly correlated pairs:")
-    for row, col, val in high_corr_pairs:
-        print(f"{row}  <->  {col}: corr = {val:.3f}")
-
-
-# %%
 # Correlation matrix on numeric features
 exclude_corr = ["company_id", "bankruptcy_next_year", "financial_health_class", "revenue_change"]
 numeric_df = df_train_fe.select_dtypes(include=[np.number]).drop(
@@ -3487,13 +3455,6 @@ plt.show()
 
 
 # %%
-# Select only numeric feature columns (exclude target / IDs / leakage-prone variables)
-exclude_corr = ["company_id", "bankruptcy_next_year", "financial_health_class", "revenue_change"]
-numeric_df = df_train_fe.select_dtypes(include=[np.number]).drop(
-    columns=[c for c in exclude_corr if c in df_train_fe.columns],
-    errors="ignore"
-)
-
 # Build ranked table of highly correlated pairs
 corr_matrix = numeric_df.corr()
 upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
@@ -4099,51 +4060,6 @@ display(results_practical_df)
 #
 # This step creates the final **`cluster_id_practical`** feature, which provides a compact representation of firms’ financial profiles.
 #
-
-# %%
-# Choose final K based on the diagnostics above
-final_k_practical = 4
-
-# Fit final K-Means on 2018–2020 only
-kmeans_practical = KMeans(n_clusters=final_k_practical, random_state=42, n_init=10)
-kmeans_practical.fit(X_cl_fit_scaled_practical)
-
-# Assign clusters to full train FE and test FE
-df_train_fe["cluster_id_practical"] = kmeans_practical.predict(X_cl_train_scaled_practical)
-df_test_fe["cluster_id_practical"] = kmeans_practical.predict(X_cl_test_scaled_practical)
-
-print(f"\nK-Means (k={final_k_practical}) applied. New feature: 'cluster_id_practical'")
-
-# Cluster profiling on TRAIN only
-summary_vars_practical = cluster_features_practical.copy()
-
-if "bankruptcy_next_year" in df_train_fe.columns:
-    agg_dict_practical = {
-        "company_id": "count",
-        "bankruptcy_next_year": "mean"
-    }
-    for col in summary_vars_practical:
-        agg_dict_practical[col] = "median"
-
-    cluster_summary_practical = (
-        df_train_fe.groupby("cluster_id_practical")
-        .agg(agg_dict_practical)
-        .rename(columns={
-            "company_id": "count",
-            "bankruptcy_next_year": "bankruptcy_rate"
-        })
-    )
-
-    cluster_summary_practical["proportion"] = cluster_summary_practical["count"] / len(df_train_fe)
-    cluster_summary_practical = cluster_summary_practical.sort_values("bankruptcy_rate", ascending=False)
-
-    print("\nCluster Analysis (Profiles):")
-    display(
-        cluster_summary_practical[
-            ["count", "proportion", "bankruptcy_rate"] + summary_vars_practical
-        ].round(4)
-    )
-
 
 # %%
 # Choose final K based on the diagnostics above

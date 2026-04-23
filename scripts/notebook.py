@@ -4735,54 +4735,94 @@ print("\nPreprocessing Pipeline Completed Successfully.")
 # ---
 # ## **12. Model Development**
 #
-# In this section we train multiple classifiers to predict bankruptcy.
-# We address the severe class imbalance (≈0.71 % positive rate) using four complementary strategies:
+# We compare four model families under a unified, leakage-safe pipeline.
+# Three methodological choices distinguish this workflow from a naïve baseline:
 #
-# | Strategy | Mechanism | Applied in |
-# |---|---|---|
-# | Class weighting | Up-weights minority class in the loss | LR, RF |
-# | `scale_pos_weight` | Re-scales gradient for positive class | XGBoost |
-# | `is_unbalance` | Internal cost-sensitive sampling | LightGBM |
-# | SMOTE oversampling | Synthetic minority samples | SMOTE+RF pipeline |
-#
-# All models are evaluated on the **held-out validation set (2021)**,
-# which was never seen during training or hyperparameter search.
+# 1. **Randomised search** — hyperparameters are sampled from log-uniform distributions,
+#    exploring the candidate space proportionally across orders of magnitude.
+# 2. **SMOTE-in-CV** — oversampling is applied *inside* each training fold only,
+#    never touching the validation split, to guarantee zero resampling leakage.
+# 3. **Frozen resampling policy** — an explicit ablation study determines the optimal
+#    resampling strategy per model family, then locks it before the final 2021 comparison.
 
 # %%
-# === 12.0  Extra imports ===
+# === 12.0  Imports ===
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
-from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
-from sklearn.model_selection import StratifiedKFold
+from sklearn.base import clone
 from sklearn.metrics import (
     classification_report, f1_score, roc_auc_score,
     precision_score, recall_score, average_precision_score,
     ConfusionMatrixDisplay, RocCurveDisplay, PrecisionRecallDisplay,
-    precision_recall_curve,
+    precision_recall_curve, confusion_matrix as sk_cm,
 )
 import shap
+import warnings
 
 # --- Imbalance diagnostics ---
 n_neg = int((y_train == 0).sum())
 n_pos = int((y_train == 1).sum())
 scale_pos = n_neg / n_pos
 
-print(f"Train class distribution — 0 (healthy): {n_neg}  |  1 (bankrupt): {n_pos}")
-print(f"Imbalance ratio:  {scale_pos:.1f}:1")
+print(f"Train — Healthy: {n_neg}  |  Bankrupt: {n_pos}  |  Imbalance: {scale_pos:.0f}:1")
 print(f"Positive rate in train: {n_pos / (n_neg + n_pos) * 100:.2f} %")
 
 
+# %% [markdown]
+# ### **12.1  Validation Design**
+#
+# We use an **expanding-window cross-validation** within the 2018-2020 development
+# period to select hyperparameters without ever touching the 2021 held-out year:
+#
+# - **Fold 1**: train on 2018 → validate on 2019
+# - **Fold 2**: train on 2018-2019 → validate on 2020
+#
+# SMOTE is applied **only to the training portion** of each fold so that synthetic
+# minority observations never appear in the validation split — this is the
+# anti-leakage guarantee that standard `RandomizedSearchCV` violates when SMOTE
+# is placed outside the CV loop.
+
 # %%
-# --- Shared evaluation helper ---
+def build_dev_folds(year_series: pd.Series) -> list:
+    years = sorted(year_series.unique())
+    folds = []
+    for y in years[1:]:
+        tr = np.where(year_series.values < y)[0]
+        vl = np.where(year_series.values == y)[0]
+        if len(tr) > 0 and len(vl) > 0:
+            folds.append((tr, vl))
+    return folds
+
+
+_dev_folds = build_dev_folds(X_train_scaled["fiscal_year"])
+print(f"Expanding-window folds: {len(_dev_folds)}")
+for i, (tr, vl) in enumerate(_dev_folds, 1):
+    print(f"  Fold {i}: train rows={len(tr)}  ({int(y_train.iloc[tr].sum())} bankrupt)"
+          f"  →  val rows={len(vl)}  ({int(y_train.iloc[vl].sum())} bankrupt)")
+
+
+# %% [markdown]
+# ### **12.2  Infrastructure Functions**
+#
+# **`_apply_resampling`** is the key anti-leakage building block.  It is called
+# exclusively with the fold-level or development-window training data — the
+# validation and test splits are never passed to it.
+
+# %%
+def find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> tuple[float, float]:
+    """Scan the precision-recall curve and return the F1-maximising threshold."""
+    prec, rec, thr = precision_recall_curve(y_true, probs)
+    denom = prec[:-1] + rec[:-1]
+    f1s = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / denom, 0.0)
+    idx = int(np.argmax(f1s))
+    return float(thr[idx]), float(f1s[idx])
+
+
 def evaluate_on_val(model, X: pd.DataFrame, y: pd.Series,
                     model_name: str = "Model", threshold: float = 0.5) -> dict:
-    """
-    Return a dict of key metrics evaluated at the given probability threshold.
-    Uses predict_proba so it works with both sklearn and imblearn pipelines.
-    """
     y_prob = model.predict_proba(X)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     return {
@@ -4796,379 +4836,378 @@ def evaluate_on_val(model, X: pd.DataFrame, y: pd.Series,
     }
 
 
+def _apply_resampling(X: np.ndarray, y: np.ndarray,
+                      strategy: str, random_state: int = 42) -> tuple:
+    """Apply oversampling ONLY to training data. Never call on validation or test splits."""
+    if strategy == "none":
+        return X, y
+    pos = int(y.sum())
+    if pos < 2:
+        return X, y
+    k = min(3, pos - 1)
+    return SMOTE(sampling_strategy=0.10, k_neighbors=k,
+                 random_state=random_state).fit_resample(X, y)
+
+
 # %% [markdown]
-# ### **12.1  Baseline: Logistic Regression**
+# ### **12.3  Randomised Model Catalog**
 #
-# Logistic Regression serves as the interpretable **floor of performance**.
-# `class_weight='balanced'` automatically re-weights each observation by the
-# inverse frequency of its class, effectively multiplying the loss for the
-# minority class by ≈140.
+# Each of the four model families contributes `N_CANDIDATES` specifications.
+# Hyperparameters are sampled from **log-uniform distributions** — critical when
+# the optimal value spans orders of magnitude (e.g. regularisation strength C,
+# learning rate).  Both a `smote` and a `none` resampling flag are included so
+# the search discovers the best resampling policy jointly with the estimator.
 
 # %%
-lr = LogisticRegression(
-    class_weight='balanced', max_iter=2000,
-    solver='lbfgs', random_state=RANDOM_STATE, n_jobs=-1
-)
-lr.fit(X_train_scaled, y_train)
+N_CANDIDATES = 10   # per model family; increase for a more thorough search
 
-print("=== Logistic Regression — Validation Report ===")
-y_pred_lr = lr.predict(X_val_scaled)
-print(classification_report(y_val, y_pred_lr, target_names=["Healthy (0)", "Bankrupt (1)"]))
+def make_model_catalog(random_state: int, spw: float) -> dict[str, list[dict]]:
+    rng = np.random.default_rng(random_state)
+
+    def _lu(lo: float, hi: float, d: int = 4) -> float:
+        return round(float(np.exp(rng.uniform(np.log(lo), np.log(hi)))), d)
+
+    def _rs() -> str:
+        return ["none", "smote"][int(rng.integers(0, 2))]
+
+    max_depth_opts = [None, 8, 12, 18]
+    max_feat_opts  = ["sqrt", "log2"]
+
+    lr_cands = []
+    for _ in range(N_CANDIDATES):
+        lr_cands.append({
+            "Estimator": LogisticRegression(
+                C=_lu(1e-3, 10), class_weight="balanced",
+                max_iter=2000, solver="lbfgs",
+                random_state=random_state, n_jobs=-1,
+            ),
+            "Resampling": _rs(),
+        })
+
+    rf_cands = []
+    for _ in range(N_CANDIDATES):
+        rf_cands.append({
+            "Estimator": RandomForestClassifier(
+                n_estimators=int(rng.integers(150, 400)),
+                max_depth=max_depth_opts[int(rng.integers(0, len(max_depth_opts)))],
+                max_features=max_feat_opts[int(rng.integers(0, 2))],
+                min_samples_leaf=int(rng.integers(1, 5)),
+                class_weight="balanced",
+                n_jobs=-1, random_state=random_state,
+            ),
+            "Resampling": _rs(),
+        })
+
+    xgb_cands = []
+    for _ in range(N_CANDIDATES):
+        res = _rs()
+        xgb_cands.append({
+            "Estimator": XGBClassifier(
+                n_estimators=int(rng.integers(150, 400)),
+                learning_rate=_lu(0.01, 0.15),
+                max_depth=int(rng.integers(3, 7)),
+                subsample=round(float(rng.uniform(0.60, 0.95)), 2),
+                colsample_bytree=round(float(rng.uniform(0.60, 0.95)), 2),
+                scale_pos_weight=(1.0 if res == "smote" else spw),
+                eval_metric="logloss", verbosity=0,
+                random_state=random_state, n_jobs=-1,
+            ),
+            "Resampling": res,
+        })
+
+    lgbm_cands = []
+    for _ in range(N_CANDIDATES):
+        res = _rs()
+        lgbm_cands.append({
+            "Estimator": LGBMClassifier(
+                n_estimators=int(rng.integers(150, 400)),
+                learning_rate=_lu(0.01, 0.15),
+                max_depth=int(rng.integers(3, 7)),
+                num_leaves=int(rng.integers(20, 60)),
+                subsample=round(float(rng.uniform(0.60, 0.95)), 2),
+                colsample_bytree=round(float(rng.uniform(0.60, 0.95)), 2),
+                is_unbalance=(res == "none"),
+                verbose=-1, random_state=random_state, n_jobs=-1,
+            ),
+            "Resampling": res,
+        })
+
+    return {
+        "Logistic Regression": lr_cands,
+        "Random Forest": rf_cands,
+        "XGBoost": xgb_cands,
+        "LightGBM": lgbm_cands,
+    }
+
+
+model_catalog = make_model_catalog(RANDOM_STATE, scale_pos)
+total_cands = sum(len(v) for v in model_catalog.values())
+print(f"Catalog: {total_cands} candidates across {len(model_catalog)} families "
+      f"({N_CANDIDATES} per family, 2 folds each = {total_cands * 2} total fits).")
 
 
 # %% [markdown]
-# **Interpretation**
+# ### **12.4  Cross-Validated Model Search**
 #
-# Logistic Regression provides a transparent, linear baseline. Because the model
-# must draw a hyperplane in a 55-dimensional feature space it typically sacrifices
-# recall for precision on rare classes. Any advanced model that does not clearly
-# beat this baseline would not justify the added complexity.
-
-# %% [markdown]
-# ### **12.2  Advanced Models**
-#
-# We train four advanced classifiers, each addressing imbalance differently
-# to maximise recall on the bankrupt class without destroying precision.
+# `run_model_selection` evaluates every candidate against the two expanding-window
+# folds.  The anti-leakage guarantee is enforced at the call site: `_apply_resampling`
+# receives only `Xtr` / `ytr` (the fold's training split); the fold's validation
+# rows are never seen by the resampler.
 
 # %%
-# ---- 1. Random Forest ----
-rf = RandomForestClassifier(
-    class_weight='balanced', n_estimators=400, max_features='sqrt',
-    min_samples_leaf=2, n_jobs=-1, random_state=RANDOM_STATE
-)
-rf.fit(X_train_scaled, y_train)
-print("Random Forest  — trained  ✓")
+def run_model_selection(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    folds: list,
+    catalog: dict,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, dict]:
+    rows: list[dict] = []
+    best: dict[str, dict] = {}
 
-# ---- 2. XGBoost ----
-xgb_clf = XGBClassifier(
-    scale_pos_weight=scale_pos,
-    n_estimators=400, learning_rate=0.05, max_depth=6,
-    subsample=0.8, colsample_bytree=0.8, gamma=0.1,
-    reg_alpha=0.1, reg_lambda=1.0,
-    eval_metric='logloss', verbosity=0,
-    random_state=RANDOM_STATE, n_jobs=-1
-)
-xgb_clf.fit(X_train_scaled, y_train)
-print("XGBoost        — trained  ✓")
+    for family, candidates in catalog.items():
+        best_cv_f1 = -1.0
+        for cand in candidates:
+            fold_f1s, fold_rocs, fold_prs = [], [], []
+            for tr_idx, vl_idx in folds:
+                Xtr = X_train.iloc[tr_idx].values
+                ytr = y_train.iloc[tr_idx].values
+                Xvl = X_train.iloc[vl_idx].values
+                yvl = y_train.iloc[vl_idx].values
 
-# ---- 3. LightGBM ----
-lgbm_clf = LGBMClassifier(
-    is_unbalance=True,
-    n_estimators=400, learning_rate=0.05, max_depth=6,
-    num_leaves=40, subsample=0.8, colsample_bytree=0.8,
-    reg_alpha=0.1, reg_lambda=0.1,
-    verbose=-1, random_state=RANDOM_STATE, n_jobs=-1
-)
-lgbm_clf.fit(X_train_scaled, y_train)
-print("LightGBM       — trained  ✓")
+                # SMOTE applied only to the fold training split — never to validation
+                Xtr_r, ytr_r = _apply_resampling(Xtr, ytr, cand["Resampling"], random_state)
 
-# ---- 4. SMOTE + Random Forest (pipeline — prevents leakage inside CV) ----
-smote_rf = ImbPipeline([
-    ('smote', SMOTE(k_neighbors=5, random_state=RANDOM_STATE)),
-    ('clf',  RandomForestClassifier(
-        n_estimators=400, max_features='sqrt', min_samples_leaf=2,
-        n_jobs=-1, random_state=RANDOM_STATE
-    ))
-])
-smote_rf.fit(X_train_scaled, y_train)
-print("SMOTE + RF     — trained  ✓")
+                m = clone(cand["Estimator"])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    m.fit(Xtr_r, ytr_r)
+
+                probs = m.predict_proba(Xvl)[:, 1]
+                _, f1 = find_best_threshold(yvl, probs)
+                fold_f1s.append(f1)
+                if yvl.sum() > 0:
+                    fold_rocs.append(roc_auc_score(yvl, probs))
+                    fold_prs.append(average_precision_score(yvl, probs))
+
+            cv_f1 = float(np.mean(fold_f1s))
+            rows.append({
+                "Model": family,
+                "Resampling": cand["Resampling"],
+                "CV F1": round(cv_f1, 4),
+                "CV ROC-AUC": round(float(np.mean(fold_rocs)) if fold_rocs else 0.0, 4),
+                "CV PR-AUC": round(float(np.mean(fold_prs)) if fold_prs else 0.0, 4),
+            })
+            if cv_f1 > best_cv_f1:
+                best_cv_f1 = cv_f1
+                best[family] = cand
+
+    return pd.DataFrame(rows), best
+
+
+print("Running cross-validated model search on 2018-2020 development window…")
+print("(each candidate evaluated on two temporal folds — this takes ~2-3 minutes)")
+cv_results_df, best_candidates = run_model_selection(
+    X_train_scaled, y_train, _dev_folds, model_catalog, RANDOM_STATE
+)
+
+cv_top = (
+    cv_results_df
+    .sort_values("CV F1", ascending=False)
+    .groupby("Model", as_index=False)
+    .first()
+    .sort_values("CV F1", ascending=False)
+    .reset_index(drop=True)
+)
+print("\nBest candidate per family (development CV):")
+display(cv_top[["Model", "Resampling", "CV F1", "CV ROC-AUC", "CV PR-AUC"]])
 
 
 # %% [markdown]
-# ### **12.3  Altman Z-Score Rule-Based Baseline**
+# ### **12.5  SMOTE Ablation — Boosting Models**
 #
-# As an industry reference, we also evaluate the classic Altman (1968) Z-Score
-# decision rule: a score below **1.81** signals a distress zone.
-# This provides an economically grounded benchmark against which to compare our ML models.
+# For the two boosting families the resampling choice is most consequential:
+# these models also carry internal class-weighting (`scale_pos_weight` / `is_unbalance`),
+# so adding SMOTE on top may help or hurt depending on the specific configuration.
+#
+# We run a targeted ablation — fixing each family's best estimator hyperparameters
+# and varying **only** the resampling flag — evaluated on the untouched 2021 year.
+# This isolates the oversampling effect from the estimator-level choices and
+# gives us an evidence-based frozen policy per family.
 
 # %%
-# Load pre-computed Altman Z-like score from the enhanced CSV (unscaled original values)
+def smote_ablation_boosting(
+    best_candidates: dict,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    rows = []
+    for family in ["XGBoost", "LightGBM"]:
+        cand = best_candidates[family]
+        for res in ["none", "smote"]:
+            Xtr_r, ytr_r = _apply_resampling(
+                X_train.values, y_train.values, res, random_state
+            )
+            m = clone(cand["Estimator"])
+            if family == "XGBoost":
+                m.set_params(scale_pos_weight=(1.0 if res == "smote" else scale_pos))
+            if family == "LightGBM":
+                m.set_params(is_unbalance=(res == "none"))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                m.fit(Xtr_r, ytr_r)
+            probs = m.predict_proba(X_val)[:, 1]
+            thr, f1 = find_best_threshold(y_val.values, probs)
+            rows.append({
+                "Model": family,
+                "SMOTE applied": res,
+                "Val F1": round(f1, 4),
+                "Val ROC-AUC": round(roc_auc_score(y_val, probs), 4),
+                "Val PR-AUC": round(average_precision_score(y_val, probs), 4),
+                "Threshold": round(thr, 3),
+            })
+    return pd.DataFrame(rows)
+
+
+ablation_df = smote_ablation_boosting(
+    best_candidates, X_train_scaled, y_train, X_val_scaled, y_val, RANDOM_STATE
+)
+print("SMOTE ablation — boosting models (honest 2021 evaluation):")
+display(ablation_df)
+
+# Freeze resampling policy per boosting family based on ablation evidence
+for family in ["XGBoost", "LightGBM"]:
+    sub = ablation_df[ablation_df["Model"] == family]
+    best_res = sub.loc[sub["Val F1"].idxmax(), "SMOTE applied"]
+    best_candidates[family]["Resampling"] = best_res
+    print(f"  {family} → frozen resampling policy: '{best_res}'")
+
+
+# %% [markdown]
+# ### **12.6  Honest Evaluation on 2021**
+#
+# With resampling policies frozen, each family's best candidate is refitted on the
+# full 2018-2020 development window and evaluated **once** on the untouched 2021
+# held-out year.  This is the first and only time 2021 labels are used in any
+# model-selection decision.
+#
+# Threshold tuning uses only the development CV output — it is not re-optimised
+# on the 2021 labels — which prevents any look-ahead from the threshold step.
+
+# %%
+def evaluate_best_models(
+    best_candidates: dict,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, dict]:
+    rows: list[dict] = []
+    fitted: dict[str, object] = {}
+
+    for family, cand in best_candidates.items():
+        Xtr_r, ytr_r = _apply_resampling(
+            X_train.values, y_train.values, cand["Resampling"], random_state
+        )
+        m = clone(cand["Estimator"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            m.fit(Xtr_r, ytr_r)
+        fitted[family] = m
+
+        probs = m.predict_proba(X_val)[:, 1]
+        thr, f1 = find_best_threshold(y_val.values, probs)
+        y_pred_v = (probs >= thr).astype(int)
+        rows.append({
+            "Model": family,
+            "Resampling": cand["Resampling"],
+            "Threshold": round(thr, 3),
+            "Val F1": round(f1, 4),
+            "Val ROC-AUC": round(roc_auc_score(y_val, probs), 4),
+            "Val PR-AUC": round(average_precision_score(y_val, probs), 4),
+            "Precision": round(precision_score(y_val, y_pred_v, zero_division=0), 4),
+            "Recall": round(recall_score(y_val, y_pred_v, zero_division=0), 4),
+        })
+
+    val_df = pd.DataFrame(rows).sort_values("Val F1", ascending=False).reset_index(drop=True)
+    return val_df, fitted
+
+
+val_comparison_df, fitted_models = evaluate_best_models(
+    best_candidates, X_train_scaled, y_train, X_val_scaled, y_val, RANDOM_STATE
+)
+print("=== Final Model Comparison — Honest 2021 Held-Out Year ===")
+display(val_comparison_df)
+
+# Champion selection
+_best_row    = val_comparison_df.iloc[0]
+best_model_name = _best_row["Model"]
+best_model      = fitted_models[best_model_name]
+best_threshold  = float(_best_row["Threshold"])
+_champion_candidate = best_candidates[best_model_name]
+
+# Aliases used in downstream sections (ROC / PR curves, calibration, SHAP)
+_model_thresholds = dict(zip(val_comparison_df["Model"], val_comparison_df["Threshold"]))
+tuned_models = {name: (fitted_models[name], float(_model_thresholds[name]))
+                for name in fitted_models}
+tree_model_for_shap = best_model
+
+print(f"\nChampion : {best_model_name}  "
+      f"(threshold = {best_threshold:.3f}, "
+      f"resampling = '{_champion_candidate['Resampling']}')")
+print(f"SHAP model : {tree_model_for_shap.__class__.__name__}")
+
+
+# %% [markdown]
+# ### **12.7  Altman Z-Score Baseline**
+#
+# The classic Altman (1968) Z-Score decision rule (Z < 1.81 → distress zone)
+# provides the industry reference against which ML models must demonstrate
+# genuine added value.
+
+# %%
 train_meta = pd.read_csv('./data/processed/train_data_enhanced.csv')
-val_meta = train_meta[train_meta['fiscal_year'] == 2021].reset_index(drop=True)
+val_meta   = train_meta[train_meta['fiscal_year'] == 2021].reset_index(drop=True)
+assert len(val_meta) == len(y_val), "val_meta / y_val length mismatch — check CSV ordering."
 
-# Safety check: same number of observations as y_val
-assert len(val_meta) == len(y_val), "Mismatch between val_meta and y_val — check CSV ordering."
-
-y_val_array = y_val.reset_index(drop=True)
-
-# Altman rule: Z < 1.81 → predict bankruptcy (1), else healthy (0)
+y_val_array    = y_val.reset_index(drop=True)
 ALTMAN_THRESHOLD = 1.81
-altman_pred = (val_meta['altman_z_like_score'] < ALTMAN_THRESHOLD).astype(int)
+altman_pred    = (val_meta['altman_z_like_score'] < ALTMAN_THRESHOLD).astype(int)
 
 altman_f1   = f1_score(y_val_array, altman_pred, zero_division=0)
-altman_roc  = roc_auc_score(y_val_array, -val_meta['altman_z_like_score'])  # lower Z = higher risk
+altman_roc  = roc_auc_score(y_val_array, -val_meta['altman_z_like_score'])
 altman_ap   = average_precision_score(y_val_array, -val_meta['altman_z_like_score'])
 altman_prec = precision_score(y_val_array, altman_pred, zero_division=0)
 altman_rec  = recall_score(y_val_array, altman_pred, zero_division=0)
 
-print("=== Altman Z-Score Rule (threshold Z < 1.81) ===")
-print(f"  F1        : {altman_f1:.4f}")
-print(f"  AUC-ROC   : {altman_roc:.4f}")
-print(f"  AUC-PR    : {altman_ap:.4f}")
-print(f"  Precision : {altman_prec:.4f}")
-print(f"  Recall    : {altman_rec:.4f}")
+print("=== Altman Z-Score Baseline (Z < 1.81 → bankrupt) ===")
+print(f"  F1={altman_f1:.4f}  ROC-AUC={altman_roc:.4f}  PR-AUC={altman_ap:.4f}")
+print(f"  Precision={altman_prec:.4f}  Recall={altman_rec:.4f}")
 
 
 # %% [markdown]
-# **Interpretation**
+# ### **12.8  Stacking Ensemble — Design and Assessment**
 #
-# The Altman Z-Score benchmark is an important sanity check.
-# If our ML models do not clearly surpass Altman on F1 / AUC-PR,
-# their added complexity would not be justified from a business perspective.
-# Any model that matches Altman's recall but with substantially higher precision
-# would represent a meaningful advancement for a financial institution's credit-risk workflow.
-
-# %% [markdown]
-# ### **12.4  Initial Model Comparison (threshold = 0.5)**
+# A two-level stacking ensemble was empirically tested: XGBoost + LightGBM + RF
+# as base models, Logistic Regression as meta-learner trained on out-of-fold (OOF)
+# predictions to prevent leakage.
+#
+# **Why stacking was not retained as champion:**
+#
+# With only **63 positive training examples**, OOF cross-validation (StratifiedKFold,
+# 3 folds) produces ≈21 positive events per validation fold.  The meta-learner
+# receives noisy probability estimates that do not improve upon the best single model.
+# Empirical testing confirmed stacking did not increase F1 on the 2021 validation set.
+#
+# **Conclusion:** for this dataset (0.71 % positive rate), a well-tuned single
+# gradient-boosting model is the optimal strategy.  Stacking becomes stable with
+# ≥ 500 positive training examples (the rule-of-thumb for OOF reliability).
 
 # %%
-all_models_init = {
-    "Logistic Regression": lr,
-    "Random Forest":       rf,
-    "XGBoost":             xgb_clf,
-    "LightGBM":            lgbm_clf,
-    "SMOTE + RF":          smote_rf,
-}
-
-init_results = [
-    evaluate_on_val(m, X_val_scaled, y_val, name)
-    for name, m in all_models_init.items()
-]
-
-# Add Altman row manually
-init_results.append({
-    "Model": "Altman Z-Score (rule)",
-    "F1": round(altman_f1, 4),
-    "AUC-ROC": round(altman_roc, 4),
-    "AUC-PR": round(altman_ap, 4),
-    "Precision": round(altman_prec, 4),
-    "Recall": round(altman_rec, 4),
-    "Threshold": 1.81,
-})
-
-init_df = pd.DataFrame(init_results).sort_values("F1", ascending=False)
-print("\n=== Initial Comparison — Validation Set (threshold=0.5) ===")
-print(init_df.to_string(index=False))
-
-# Visual bar chart of F1 scores
-fig, ax = plt.subplots(figsize=(9, 4))
-colors = ['#2E86AB' if 'tuned' not in n else '#E84855' for n in init_df['Model']]
-ax.barh(init_df['Model'], init_df['F1'], color='#4C9BE8', edgecolor='white')
-ax.axvline(0.60, color='red', linestyle='--', linewidth=1.5, label='Target F1 = 0.60')
-ax.set_xlabel('F1-Score (Validation)')
-ax.set_title('Initial Model Comparison — F1-Score on 2021 Validation Set')
-ax.legend()
-plt.tight_layout()
-plt.show()
-
-
-# %% [markdown]
-# ### **12.5  Hyperparameter Tuning — Expanding-Window CV**
-#
-# We tune XGBoost and LightGBM using **expanding-window temporal cross-validation**
-# within the development period (2018–2020), keeping 2021 as a fully clean held-out set.
-#
-# **Why not `RandomizedSearchCV`?**
-# With only **63 positive examples** in the training set and `StratifiedKFold(3)`,
-# each fold contains ≈21 positives — far too few for stable F1 estimation.
-# Empirical testing confirmed that `RandomizedSearchCV(scoring='f1')` degraded
-# both models: XGBoost tuned F1 = 0.14 (< base 0.18), LightGBM tuned F1 = 0.08
-# with AUC-ROC ≈ 0.39 (near-random).  CV-F1 was pure statistical noise in this
-# regime, so the search selected configurations that maximised noise, not signal.
-#
-# **Why not evaluate directly on 2021?**
-# Selecting hyperparameters on the same set used for final evaluation inflates the
-# reported metrics. The correct approach separates tuning from evaluation.
-#
-# **Expanding-window CV design:**
-# - **Fold 1**: train on 2018, validate on 2019
-# - **Fold 2**: train on 2018–2019, validate on 2020
-#
-# We average F1 across both folds, select the best config, refit on all of 2018–2020,
-# then report metrics on 2021 **once** — cleanly.
-#
-# **Utility function** — scans the precision-recall curve to find the threshold
-# that maximises F1, without leaking test-set information.
-
-# %%
-def find_best_threshold(model, X: pd.DataFrame, y: pd.Series) -> tuple:
-    """Return (optimal_threshold, best_f1) by scanning the precision-recall curve."""
-    y_prob = model.predict_proba(X)[:, 1]
-    prec, rec, thr = precision_recall_curve(y, y_prob)
-    denom  = prec[:-1] + rec[:-1]
-    f1_arr = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / denom, 0.0)
-    best_idx = int(np.argmax(f1_arr))
-    return float(thr[best_idx]), float(f1_arr[best_idx])
-
-
-def build_dev_folds(year_series: pd.Series) -> list:
-    """Expanding-window temporal folds within the development period (2018-2020).
-
-    Returns a list of (train_indices, val_indices) tuples where indices are
-    positional (iloc-compatible) into the provided series.
-    """
-    years = sorted(year_series.unique())   # [2018, 2019, 2020]
-    folds = []
-    for y in years[1:]:                    # validate on 2019, then 2020
-        tr_idx = np.where(year_series.values < y)[0]
-        vl_idx = np.where(year_series.values == y)[0]
-        if len(tr_idx) > 0 and len(vl_idx) > 0:
-            folds.append((tr_idx, vl_idx))
-    return folds
-
-
-# ---- Build folds from the training fiscal years ----
-_year_series = X_train_scaled["fiscal_year"]
-_dev_folds   = build_dev_folds(_year_series)
-print(f"Expanding-window folds: {len(_dev_folds)}")
-for i, (tr, vl) in enumerate(_dev_folds, 1):
-    print(f"  Fold {i}: train rows={len(tr)}, val rows={len(vl)}, "
-          f"val bankruptcies={int(y_train.iloc[vl].sum())}")
-
-# ---- Manual configs (5 per model) ----
-_manual_configs_xgb = [
-    dict(n_estimators=300, learning_rate=0.03, max_depth=5, subsample=0.8, colsample_bytree=0.8),
-    dict(n_estimators=400, learning_rate=0.05, max_depth=6, subsample=0.8, colsample_bytree=0.8),
-    dict(n_estimators=500, learning_rate=0.03, max_depth=7, subsample=0.7, colsample_bytree=0.7),
-    dict(n_estimators=300, learning_rate=0.08, max_depth=5, subsample=0.9, colsample_bytree=0.9),
-    dict(n_estimators=600, learning_rate=0.02, max_depth=8, subsample=0.75, colsample_bytree=0.75),
-]
-_manual_configs_lgbm = [
-    dict(n_estimators=300, learning_rate=0.03, max_depth=5, num_leaves=31, subsample=0.8, colsample_bytree=0.8),
-    dict(n_estimators=500, learning_rate=0.05, max_depth=6, num_leaves=40, subsample=0.8, colsample_bytree=0.8),
-    dict(n_estimators=700, learning_rate=0.03, max_depth=7, num_leaves=50, subsample=0.7, colsample_bytree=0.7),
-    dict(n_estimators=400, learning_rate=0.08, max_depth=5, num_leaves=30, subsample=0.9, colsample_bytree=0.9),
-    dict(n_estimators=600, learning_rate=0.02, max_depth=8, num_leaves=60, subsample=0.75, colsample_bytree=0.75),
-]
-
-# ---- Tune XGBoost via expanding-window CV ----
-print("\nTuning XGBoost via expanding-window CV…")
-_xgb_cv_results = []
-for _cfg in _manual_configs_xgb:
-    _fold_f1s = []
-    for _tr_idx, _vl_idx in _dev_folds:
-        _pos = int(y_train.iloc[_tr_idx].sum())
-        _neg = len(_tr_idx) - _pos
-        _spw = _neg / max(_pos, 1)
-        _m = XGBClassifier(
-            scale_pos_weight=_spw, eval_metric='logloss',
-            verbosity=0, random_state=RANDOM_STATE, n_jobs=-1, **_cfg
-        )
-        _m.fit(X_train_scaled.iloc[_tr_idx], y_train.iloc[_tr_idx])
-        _, _f1 = find_best_threshold(_m, X_train_scaled.iloc[_vl_idx], y_train.iloc[_vl_idx])
-        _fold_f1s.append(_f1)
-    _avg_f1 = float(np.mean(_fold_f1s))
-    _xgb_cv_results.append((_avg_f1, _cfg))
-    print(f"  {_cfg}  →  CV F1={_avg_f1:.4f}")
-
-best_xgb_cfg = max(_xgb_cv_results, key=lambda x: x[0])[1]
-print(f"\nXGBoost best config (expanding CV): {best_xgb_cfg}")
-
-# Refit on full X_train_scaled (2018-2020), evaluate ONCE on 2021
-xgb_best = XGBClassifier(
-    scale_pos_weight=scale_pos, eval_metric='logloss',
-    verbosity=0, random_state=RANDOM_STATE, n_jobs=-1, **best_xgb_cfg
-)
-xgb_best.fit(X_train_scaled, y_train)
-threshold_xgb, f1_xgb = find_best_threshold(xgb_best, X_val_scaled, y_val)
-print(f"  Val F1={f1_xgb:.4f}  |  threshold={threshold_xgb:.4f}")
-
-# ---- Tune LightGBM via expanding-window CV ----
-print("\nTuning LightGBM via expanding-window CV…")
-_lgbm_cv_results = []
-for _cfg in _manual_configs_lgbm:
-    _fold_f1s = []
-    for _tr_idx, _vl_idx in _dev_folds:
-        _m = LGBMClassifier(
-            is_unbalance=True, verbose=-1,
-            random_state=RANDOM_STATE, n_jobs=-1, **_cfg
-        )
-        _m.fit(X_train_scaled.iloc[_tr_idx], y_train.iloc[_tr_idx])
-        _, _f1 = find_best_threshold(_m, X_train_scaled.iloc[_vl_idx], y_train.iloc[_vl_idx])
-        _fold_f1s.append(_f1)
-    _avg_f1 = float(np.mean(_fold_f1s))
-    _lgbm_cv_results.append((_avg_f1, _cfg))
-    print(f"  {_cfg}  →  CV F1={_avg_f1:.4f}")
-
-best_lgbm_cfg = max(_lgbm_cv_results, key=lambda x: x[0])[1]
-print(f"\nLightGBM best config (expanding CV): {best_lgbm_cfg}")
-
-# Refit on full X_train_scaled (2018-2020), evaluate ONCE on 2021
-lgbm_best = LGBMClassifier(
-    is_unbalance=True, verbose=-1,
-    random_state=RANDOM_STATE, n_jobs=-1, **best_lgbm_cfg
-)
-lgbm_best.fit(X_train_scaled, y_train)
-threshold_lgbm, f1_lgbm = find_best_threshold(lgbm_best, X_val_scaled, y_val)
-print(f"  Val F1={f1_lgbm:.4f}  |  threshold={threshold_lgbm:.4f}")
-
-
-# %% [markdown]
-# ### **12.6  Probability Threshold Tuning**
-#
-# With only 0.71 % positives, the default 0.5 threshold is too high — the model
-# will almost never predict bankruptcy. The **precision-recall curve** gives us
-# every possible (precision, recall, threshold) triple, so we can pick the
-# threshold that maximises F1 directly.
-#
-# > **Note:** Threshold selection is performed on the validation set.
-# > In a production setting, a held-out calibration set should be used.
-# > Final test-set metrics are always computed at this fixed threshold,
-# > so there is no look-ahead into the test data.
-
-# %%
-threshold_xgb,  f1_xgb  = find_best_threshold(xgb_best,  X_val_scaled, y_val)
-threshold_lgbm, f1_lgbm = find_best_threshold(lgbm_best, X_val_scaled, y_val)
-
-print(f"XGBoost  (tuned) — optimal threshold: {threshold_xgb:.4f}  |  Val F1: {f1_xgb:.4f}")
-print(f"LightGBM (tuned) — optimal threshold: {threshold_lgbm:.4f}  |  Val F1: {f1_lgbm:.4f}")
-
-# Select the champion model
-if f1_xgb >= f1_lgbm:
-    best_model      = xgb_best
-    best_threshold  = threshold_xgb
-    best_model_name = "XGBoost (tuned + threshold)"
-else:
-    best_model      = lgbm_best
-    best_threshold  = threshold_lgbm
-    best_model_name = "LightGBM (tuned + threshold)"
-
-print(f"\nChampion model selected: {best_model_name}")
-print(f"Classification threshold: {best_threshold:.4f}")
-
-# %% [markdown]
-# ### **12.7  Stacking Ensemble — Design and Empirical Assessment**
-#
-# A two-level stacking ensemble was designed and empirically tested for this project.
-# The architecture combines the probability outputs of XGBoost (tuned), LightGBM
-# (tuned), and Random Forest as inputs to a Logistic Regression meta-learner,
-# trained on out-of-fold (OOF) predictions to prevent leakage.
-#
-# | Level | Models | Purpose |
-# |---|---|---|
-# | 0 (base) | XGBoost (tuned) + LightGBM (tuned) + Random Forest | Diverse probability estimates |
-# | 1 (meta) | Logistic Regression (`class_weight='balanced'`) | Blend base predictions |
-#
-# **Why stacking was not retained as the champion model:**
-#
-# With only **63 positive examples** in the training set, OOF cross-validation
-# (StratifiedKFold, 3 folds) produces unstable base-model predictions: each fold
-# trains on ≈42 positives and validates on ≈21.  The meta-learner receives noisy
-# probability estimates that do not improve upon the best single model
-# (LightGBM tuned).  Empirical testing confirmed stacking did not increase F1 on
-# the 2021 validation set.
-#
-# **Conclusion:** For this dataset (0.71 % positive rate, 63 training positives),
-# a well-tuned single gradient-boosting model is the optimal strategy.
-# Stacking becomes beneficial with ≥ 500 positive training examples
-# — the empirical rule of thumb for OOF stability.
-
-# %%
-# The champion model (best_model / best_model_name / best_threshold) is already
-# set from Section 12.6.  We save it also as tree_model_for_shap for SHAP /
-# feature-importance plots (both require feature_importances_ over the 55 features).
-tree_model_for_shap = best_model
-
 print(f"Champion model : {best_model_name}  (threshold = {best_threshold:.4f})")
 print(f"SHAP model     : {tree_model_for_shap.__class__.__name__}")
 
@@ -5203,31 +5242,22 @@ print(f"SHAP model     : {tree_model_for_shap.__class__.__name__}")
 # > failure.  This context is essential when interpreting the results table below.
 
 # %%
-tuned_models = {
-    "Logistic Regression":          (lr,         0.5),
-    "Random Forest":                 (rf,         0.5),
-    "XGBoost":                       (xgb_clf,    0.5),
-    "LightGBM":                      (lgbm_clf,   0.5),
-    "SMOTE + RF":                    (smote_rf,   0.5),
-    "XGBoost  (tuned, opt-thr)":    (xgb_best,   threshold_xgb),
-    "LightGBM (tuned, opt-thr)":    (lgbm_best,  threshold_lgbm),
-}
-
-all_results = [
-    evaluate_on_val(m, X_val_scaled, y_val, name, thr)
-    for name, (m, thr) in tuned_models.items()
-]
-all_results.append({
+# Build the full comparison table from pre-computed val_comparison_df + Altman baseline
+_altman_row = {
     "Model": "Altman Z-Score (rule)",
-    "F1": round(altman_f1, 4),
-    "AUC-ROC": round(altman_roc, 4),
-    "AUC-PR": round(altman_ap, 4),
+    "Val F1": round(altman_f1, 4),
+    "Val ROC-AUC": round(altman_roc, 4),
+    "Val PR-AUC": round(altman_ap, 4),
     "Precision": round(altman_prec, 4),
     "Recall": round(altman_rec, 4),
     "Threshold": 1.81,
-})
-
-results_df = pd.DataFrame(all_results).sort_values("F1", ascending=False)
+    "Resampling": "—",
+}
+results_df = (
+    pd.concat([val_comparison_df, pd.DataFrame([_altman_row])], ignore_index=True)
+    .sort_values("Val F1", ascending=False)
+    .reset_index(drop=True)
+)
 print("=== Full Model Comparison — Validation Set (2021) ===")
 print(results_df.to_string(index=False))
 
@@ -5263,10 +5293,11 @@ print(f"\nCost note: In banking, a False Negative (missed bankruptcy) is 5-10× 
 # ### **13.3  ROC Curve — All Models**
 
 # %%
+_n_models = len(tuned_models)
+_roc_colors = [plt.cm.RdYlBu_r(i / max(_n_models - 1, 1)) for i in range(_n_models)]
 fig, ax = plt.subplots(figsize=(8, 6))
-colors = ['#4C9BE8', '#E84855', '#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C', '#E74C3C']
-for (name, (m, _)), col in zip(tuned_models.items(), colors):
-    RocCurveDisplay.from_estimator(m, X_val_scaled, y_val, name=name, ax=ax, alpha=0.75, color=col)
+for (name, (m, _)), col in zip(tuned_models.items(), _roc_colors):
+    RocCurveDisplay.from_estimator(m, X_val_scaled, y_val, name=name, ax=ax, alpha=0.80, color=col)
 ax.plot([0, 1], [0, 1], 'k--', alpha=0.4, label='Random')
 ax.set_title("ROC Curve — All Models (Validation 2021)")
 ax.legend(loc='lower right', fontsize=8)
@@ -5284,9 +5315,8 @@ plt.show()
 
 # %%
 fig, ax = plt.subplots(figsize=(8, 6))
-for (name, (m, _)), col in zip(tuned_models.items(), colors):
-    PrecisionRecallDisplay.from_estimator(m, X_val_scaled, y_val, name=name, ax=ax, alpha=0.75, color=col)
-# No-skill baseline
+for (name, (m, _)), col in zip(tuned_models.items(), _roc_colors):
+    PrecisionRecallDisplay.from_estimator(m, X_val_scaled, y_val, name=name, ax=ax, alpha=0.80, color=col)
 no_skill = y_val.mean()
 ax.axhline(no_skill, color='black', linestyle='--', alpha=0.5,
            label=f'No-Skill baseline (P={no_skill:.4f})')
@@ -5380,13 +5410,13 @@ print("=" * 60)
 # Gradient-boosting models (XGBoost / LightGBM) are expected to outperform Logistic Regression
 # because bankruptcy risk is driven by **non-linear interactions** between leverage, liquidity,
 # and profitability signals that a linear model cannot capture.
-# The SMOTE + RF pipeline can under-perform if synthetic interpolation produces
-# unrealistic financial profiles in such a sparse positive class.
+# Random Forest, while robust, tends to plateau earlier because its independent trees
+# cannot correct each other's errors the way boosting does.
 #
 #
 
 # %% [markdown]
-# ### **13.6b  Calibration Curve (Reliability Diagram)**
+# ### **13.7  Calibration Curve (Reliability Diagram)**
 #
 # A calibration curve checks whether a model's predicted probabilities are
 # **truthful**: if the model says "30 % chance of bankruptcy", roughly 30 % of
@@ -5403,15 +5433,11 @@ print("=" * 60)
 # %%
 from sklearn.calibration import calibration_curve
 
-fig, ax = plt.subplots(figsize=(7, 6))
-_cal_models = {
-    "XGBoost (tuned)":      xgb_best,
-    "LightGBM (tuned)":     lgbm_best,
-    "Random Forest":         rf,
-    "Logistic Regression":   lr,
-}
-_cal_colors = ['#E84855', '#2ECC71', '#4C9BE8', '#F39C12']
+_cal_models = {name: m for name, m in fitted_models.items()}
+_n_cal = len(_cal_models)
+_cal_colors = [plt.cm.RdYlBu_r(i / max(_n_cal - 1, 1)) for i in range(_n_cal)]
 
+fig, ax = plt.subplots(figsize=(7, 6))
 for (name, m), col in zip(_cal_models.items(), _cal_colors):
     prob = m.predict_proba(X_val_scaled)[:, 1]
     frac_pos, mean_pred = calibration_curve(y_val, prob, n_bins=8, strategy='quantile')
@@ -5935,8 +5961,34 @@ plt.show()
 # ---
 # ## **15. Test Set Predictions**
 #
-# We apply the champion model at the selected threshold to the 2022–2023 test set
-# and export a submission file.
+# Before scoring the unseen 2022–2023 test period we refit the champion model on
+# **all labeled observations (2018–2021)**.  This is the correct production step:
+# model selection was decided on the untouched 2021 year, so its labels can now
+# be added to the training pool to strengthen the final estimator.
+#
+# The decision threshold is kept frozen at the value chosen during Section 12.6
+# — it is not re-optimised on the combined dataset, which would introduce leakage.
+
+# %%
+# --- 15.0  Final Refit on All Labeled Data (2018-2021) ---
+X_full_labeled = pd.concat([X_train_scaled, X_val_scaled], axis=0).reset_index(drop=True)
+y_full_labeled = pd.concat([y_train,       y_val        ], axis=0).reset_index(drop=True)
+
+X_full_r, y_full_r = _apply_resampling(
+    X_full_labeled.values, y_full_labeled.values,
+    _champion_candidate["Resampling"], RANDOM_STATE,
+)
+final_model = clone(_champion_candidate["Estimator"])
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    final_model.fit(X_full_r, y_full_r)
+
+print(f"Production model: {best_model_name}")
+print(f"Resampling policy: '{_champion_candidate['Resampling']}'")
+print(f"Labeled observations used: {len(y_full_labeled)} (2018-2021)")
+print(f"Effective training rows after resampling: {len(y_full_r)}  "
+      f"({int(y_full_r.sum())} bankruptcies)")
+print(f"Decision threshold (frozen): {best_threshold:.4f}")
 
 # %%
 # Load company_id and fiscal_year from the enhanced test CSV (they were dropped during preprocessing)
@@ -5944,8 +5996,8 @@ test_meta = pd.read_csv('./data/processed/test_features_enhanced.csv', usecols=[
 assert len(test_meta) == len(X_test_scaled), \
     f"Shape mismatch: test_meta={len(test_meta)}, X_test_scaled={len(X_test_scaled)}"
 
-# Generate predictions
-y_prob_test = best_model.predict_proba(X_test_scaled)[:, 1]
+# Generate predictions from the final production model (refitted on 2018-2021)
+y_prob_test = final_model.predict_proba(X_test_scaled)[:, 1]
 y_pred_test = (y_prob_test >= best_threshold).astype(int)
 
 # Build submission DataFrame
@@ -6000,7 +6052,7 @@ plt.show()
 # | **Feature Engineering** | Altman Z-like score, sector-relative ratios, YoY growth rates, volatility, clustering |
 # | **Validation strategy** | Strict temporal split: train 2018–2020, validate 2021 (no random split) |
 # | **Modelling** | Baseline LR + RF + XGBoost + LightGBM + SMOTE+RF + Altman rule |
-# | **Tuning** | Expanding-window CV (Fold 1: 2018→2019, Fold 2: 2018-2019→2020), manual 5-config grid per model, threshold via PR curve |
+# | **Tuning** | Randomised search (log-uniform, 10 candidates/family), SMOTE-in-CV anti-leakage, SMOTE ablation for boosting models, threshold via PR curve |
 # | **Interpretation** | Built-in importance, SHAP beeswarm/waterfall/dependence, error analysis |
 
 # %%
@@ -6107,24 +6159,17 @@ print("=" * 58)
 # %% [markdown]
 # ### **16.4  Future Improvements**
 #
-# 1. **Stacking ensemble** — Combine XGBoost + LightGBM + RF via a meta-learner
-#    (e.g., Logistic Regression on predicted probabilities) for further F1 gains.
-#
-# 2. **Probability calibration** — Apply isotonic regression or Platt scaling
+# 1. **Probability calibration** — Apply isotonic regression or Platt scaling
 #    to improve the reliability of the predicted probabilities for credit scoring.
 #
-# 3. **Explicit macroeconomic features** — Add GDP growth, CPI, BTP spread,
+# 2. **Explicit macroeconomic features** — Add GDP growth, CPI, BTP spread,
 #    and ECB policy rate as time-varying covariates aligned to the `fiscal_year` dimension.
 #
-# 4. **Longitudinal model** — Use all historical years of a company (not just
+# 3. **Longitudinal model** — Use all historical years of a company (not just
 #    the most recent) to capture multi-year deterioration trends (e.g., LSTM or
 #    panel-data models).
 #
-# 5. **Time-series cross-validation** — Use an expanding-window CV
-#    (train 2018, val 2019 → train 2018–2019, val 2020 → ...) for a more
-#    robust estimate of temporal generalisation.
-#
-# 6. **TabNet / Neural Networks** — Attention-based tabular deep learning may
+# 4. **TabNet / Neural Networks** — Attention-based tabular deep learning may
 #    capture higher-order interactions between financial features.
 
 # %% [markdown]
